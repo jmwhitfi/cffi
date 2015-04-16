@@ -1903,7 +1903,7 @@ _cdata_get_indexed_ptr(CDataObject *cd, PyObject *key)
 }
 
 static PyObject *
-new_array_type(CTypeDescrObject *ctptr, PyObject *lengthobj);   /* forward */
+new_array_type(CTypeDescrObject *ctptr, Py_ssize_t length);   /* forward */
 
 static CTypeDescrObject *
 _cdata_getslicearg(CDataObject *cd, PySliceObject *slice, Py_ssize_t bounds[])
@@ -1968,7 +1968,7 @@ cdata_slice(CDataObject *cd, PySliceObject *slice)
         return NULL;
 
     if (ct->ct_stuff == NULL) {
-        ct->ct_stuff = new_array_type(ct, Py_None);
+        ct->ct_stuff = new_array_type(ct, -1);
         if (ct->ct_stuff == NULL)
             return NULL;
     }
@@ -2269,18 +2269,13 @@ convert_struct_to_owning_object(char *data, CTypeDescrObject *ct); /*forward*/
 static cif_description_t *
 fb_prepare_cif(PyObject *fargs, CTypeDescrObject *, ffi_abi);      /*forward*/
 
-static PyObject *
-b_new_primitive_type(PyObject *self, PyObject *args);              /*forward*/
+static PyObject *new_primitive_type(const char *name);             /*forward*/
 
 static CTypeDescrObject *_get_ct_int(void)
 {
     static CTypeDescrObject *ct_int = NULL;
     if (ct_int == NULL) {
-        PyObject *args = Py_BuildValue("(s)", "int");
-        if (args == NULL)
-            return NULL;
-        ct_int = (CTypeDescrObject *)b_new_primitive_type(NULL, args);
-        Py_DECREF(args);
+        ct_int = (CTypeDescrObject *)new_primitive_type("int");
     }
     return ct_int;
 }
@@ -2801,14 +2796,11 @@ convert_struct_to_owning_object(char *data, CTypeDescrObject *ct)
     return (PyObject *)cd;
 }
 
-static PyObject *b_newp(PyObject *self, PyObject *args)
+static PyObject *direct_newp(CTypeDescrObject *ct, PyObject *init)
 {
-    CTypeDescrObject *ct, *ctitem;
+    CTypeDescrObject *ctitem;
     CDataObject *cd;
-    PyObject *init = Py_None;
     Py_ssize_t dataoffset, datasize, explicitlength;
-    if (!PyArg_ParseTuple(args, "O!|O:newp", &CTypeDescr_Type, &ct, &init))
-        return NULL;
 
     explicitlength = -1;
     if (ct->ct_flags & CT_POINTER) {
@@ -2897,6 +2889,15 @@ static PyObject *b_newp(PyObject *self, PyObject *args)
         }
     }
     return (PyObject *)cd;
+}
+
+static PyObject *b_newp(PyObject *self, PyObject *args)
+{
+    CTypeDescrObject *ct;
+    PyObject *init = Py_None;
+    if (!PyArg_ParseTuple(args, "O!|O:newp", &CTypeDescr_Type, &ct, &init))
+        return NULL;
+    return direct_newp(ct, init);
 }
 
 static int
@@ -3338,7 +3339,7 @@ static PyObject *b_load_library(PyObject *self, PyObject *args)
 
 /************************************************************/
 
-static PyObject *b_new_primitive_type(PyObject *self, PyObject *args)
+static PyObject *new_primitive_type(const char *name)
 {
 #define ENUM_PRIMITIVE_TYPES                                    \
        EPTYPE(c, char, CT_PRIMITIVE_CHAR)                       \
@@ -3403,7 +3404,6 @@ static PyObject *b_new_primitive_type(PyObject *self, PyObject *args)
 #undef EPTYPE
 
     CTypeDescrObject *td;
-    const char *name;
     static const struct descr_s { const char *name; int size, align, flags; }
     types[] = {
 #define EPTYPE(code, typename, flags)                   \
@@ -3421,9 +3421,6 @@ static PyObject *b_new_primitive_type(PyObject *self, PyObject *args)
     const struct descr_s *ptypes;
     int name_size;
     ffi_type *ffitype;
-
-    if (!PyArg_ParseTuple(args, "s:new_primitive_type", &name))
-        return NULL;
 
     for (ptypes=types; ; ptypes++) {
         if (ptypes->name == NULL) {
@@ -3497,14 +3494,18 @@ static PyObject *b_new_primitive_type(PyObject *self, PyObject *args)
     return NULL;
 }
 
-static PyObject *b_new_pointer_type(PyObject *self, PyObject *args)
+static PyObject *b_new_primitive_type(PyObject *self, PyObject *args)
 {
-    CTypeDescrObject *td, *ctitem;
-    const char *extra;
-
-    if (!PyArg_ParseTuple(args, "O!:new_pointer_type",
-                          &CTypeDescr_Type, &ctitem))
+    char *name;
+    if (!PyArg_ParseTuple(args, "s:new_primitive_type", &name))
         return NULL;
+    return new_primitive_type(name);
+}
+
+static PyObject *new_pointer_type(CTypeDescrObject *ctitem)
+{
+    CTypeDescrObject *td;
+    const char *extra;
 
     if (ctitem->ct_flags & CT_ARRAY)
         extra = "(*)";   /* obscure case: see test_array_add */
@@ -3528,24 +3529,45 @@ static PyObject *b_new_pointer_type(PyObject *self, PyObject *args)
     return (PyObject *)td;
 }
 
+static PyObject *b_new_pointer_type(PyObject *self, PyObject *args)
+{
+    CTypeDescrObject *ctitem;
+    if (!PyArg_ParseTuple(args, "O!:new_pointer_type",
+                          &CTypeDescr_Type, &ctitem))
+        return NULL;
+    return new_pointer_type(ctitem);
+}
+
 static PyObject *b_new_array_type(PyObject *self, PyObject *args)
 {
     PyObject *lengthobj;
+    Py_ssize_t length;
     CTypeDescrObject *ctptr;
 
     if (!PyArg_ParseTuple(args, "O!O:new_array_type",
                           &CTypeDescr_Type, &ctptr, &lengthobj))
         return NULL;
 
-    return new_array_type(ctptr, lengthobj);
+    if (lengthobj == Py_None) {
+        length = -1;
+    }
+    else {
+        length = PyNumber_AsSsize_t(lengthobj, PyExc_OverflowError);
+        if (length < 0) {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_ValueError, "negative array length");
+            return NULL;
+        }
+    }
+    return new_array_type(ctptr, length);
 }
 
 static PyObject *
-new_array_type(CTypeDescrObject *ctptr, PyObject *lengthobj)
+new_array_type(CTypeDescrObject *ctptr, Py_ssize_t length)
 {
     CTypeDescrObject *td, *ctitem;
     char extra_text[32];
-    Py_ssize_t length, arraysize;
+    Py_ssize_t arraysize;
     int flags = CT_ARRAY;
 
     if (!(ctptr->ct_flags & CT_POINTER)) {
@@ -3559,7 +3581,7 @@ new_array_type(CTypeDescrObject *ctptr, PyObject *lengthobj)
         return NULL;
     }
 
-    if (lengthobj == Py_None) {
+    if (length < 0) {
         sprintf(extra_text, "[]");
         length = -1;
         arraysize = -1;
@@ -3568,12 +3590,6 @@ new_array_type(CTypeDescrObject *ctptr, PyObject *lengthobj)
             flags |= CT_IS_UNSIZED_CHAR_A;
     }
     else {
-        length = PyNumber_AsSsize_t(lengthobj, PyExc_OverflowError);
-        if (length < 0) {
-            if (!PyErr_Occurred())
-                PyErr_SetString(PyExc_ValueError, "negative array length");
-            return NULL;
-        }
         sprintf(extra_text, "[%llu]", (unsigned PY_LONG_LONG)length);
         arraysize = length * ctitem->ct_size;
         if (length > 0 && (arraysize / length) != ctitem->ct_size) {
@@ -3594,7 +3610,7 @@ new_array_type(CTypeDescrObject *ctptr, PyObject *lengthobj)
     return (PyObject *)td;
 }
 
-static PyObject *b_new_void_type(PyObject *self, PyObject *args)
+static PyObject *new_void_type(void)
 {
     int name_size = strlen("void") + 1;
     CTypeDescrObject *td = ctypedescr_new(name_size);
@@ -3608,7 +3624,12 @@ static PyObject *b_new_void_type(PyObject *self, PyObject *args)
     return (PyObject *)td;
 }
 
-static PyObject *_b_struct_or_union_type(const char *name, int flag)
+static PyObject *b_new_void_type(PyObject *self, PyObject *args)
+{
+    return new_void_type();
+}
+
+static PyObject *new_struct_or_union_type(const char *name, int flag)
 {
     int namelen = strlen(name);
     CTypeDescrObject *td = ctypedescr_new(namelen + 1);
@@ -3633,7 +3654,7 @@ static PyObject *b_new_struct_type(PyObject *self, PyObject *args)
     flag = CT_STRUCT;
     if (strcmp(name, "struct _IO_FILE") == 0 || strcmp(name, "FILE") == 0)
         flag |= CT_IS_FILE;
-    return _b_struct_or_union_type(name, flag);
+    return new_struct_or_union_type(name, flag);
 }
 
 static PyObject *b_new_union_type(PyObject *self, PyObject *args)
@@ -3641,7 +3662,7 @@ static PyObject *b_new_union_type(PyObject *self, PyObject *args)
     char *name;
     if (!PyArg_ParseTuple(args, "s:new_union_type", &name))
         return NULL;
-    return _b_struct_or_union_type(name, CT_UNION);
+    return new_struct_or_union_type(name, CT_UNION);
 }
 
 static CFieldObject *
@@ -4370,21 +4391,14 @@ static cif_description_t *fb_prepare_cif(PyObject *fargs,
     return NULL;
 }
 
-static PyObject *b_new_function_type(PyObject *self, PyObject *args)
+static PyObject *new_function_type(PyObject *fargs,   /* tuple */
+                                   CTypeDescrObject *fresult,
+                                   int ellipsis, int fabi)
 {
-    PyObject *fargs, *fabiobj;
-    CTypeDescrObject *fresult;
+    PyObject *fabiobj;
     CTypeDescrObject *fct;
-    int ellipsis = 0, fabi = FFI_DEFAULT_ABI;
     struct funcbuilder_s funcbuilder;
     Py_ssize_t i;
-
-    if (!PyArg_ParseTuple(args, "O!O!|ii:new_function_type",
-                          &PyTuple_Type, &fargs,
-                          &CTypeDescr_Type, &fresult,
-                          &ellipsis,
-                          &fabi))
-        return NULL;
 
     if ((fresult->ct_size < 0 && !(fresult->ct_flags & CT_VOID)) ||
         (fresult->ct_flags & CT_ARRAY)) {
@@ -4447,6 +4461,22 @@ static PyObject *b_new_function_type(PyObject *self, PyObject *args)
  error:
     Py_DECREF(fct);
     return NULL;
+}
+
+static PyObject *b_new_function_type(PyObject *self, PyObject *args)
+{
+    PyObject *fargs;
+    CTypeDescrObject *fresult;
+    int ellipsis = 0, fabi = FFI_DEFAULT_ABI;
+
+    if (!PyArg_ParseTuple(args, "O!O!|ii:new_function_type",
+                          &PyTuple_Type, &fargs,
+                          &CTypeDescr_Type, &fresult,
+                          &ellipsis,
+                          &fabi))
+        return NULL;
+
+    return new_function_type(fargs, fresult, ellipsis, fabi);
 }
 
 static int convert_from_object_fficallback(char *result,
@@ -5259,12 +5289,6 @@ static PyObject *b_from_buffer(PyObject *self, PyObject *args)
     return NULL;
 }
 
-static PyObject *b__get_types(PyObject *self, PyObject *noarg)
-{
-    return PyTuple_Pack(2, (PyObject *)&CData_Type,
-                           (PyObject *)&CTypeDescr_Type);
-}
-
 /************************************************************/
 
 static char _testfunc0(char a, char b)
@@ -5569,7 +5593,6 @@ static PyMethodDef FFIBackendMethods[] = {
 #ifdef MS_WIN32
     {"getwinerror", b_getwinerror, METH_VARARGS},
 #endif
-    {"_get_types", b__get_types, METH_NOARGS},
     {"_testfunc", b__testfunc, METH_VARARGS},
     {"_testbuff", b__testbuff, METH_VARARGS},
     {NULL,     NULL}    /* Sentinel */
@@ -5684,8 +5707,10 @@ static PyObject *_cffi_from_c_wchar_t(wchar_t x) {
 }
 #endif
 
+#include "../new/cffi1_module.c"
+
 static void *cffi_exports[] = {
-    0,
+    (void *)26,
     _cffi_to_c_i8,
     _cffi_to_c_u8,
     _cffi_to_c_i16,
@@ -5715,6 +5740,7 @@ static void *cffi_exports[] = {
     _cffi_to_c__Bool,
     _prepare_pointer_call_argument,
     convert_array_from_object,
+    _cffi_init_module,
 };
 
 /************************************************************/
@@ -5722,7 +5748,7 @@ static void *cffi_exports[] = {
 #if PY_MAJOR_VERSION >= 3
 static struct PyModuleDef FFIBackendModuleDef = {
   PyModuleDef_HEAD_INIT,
-  "_cffi_backend",
+  "_cffi1_backend",
   NULL,
   -1,
   FFIBackendMethods,
@@ -5736,7 +5762,7 @@ PyInit__cffi_backend(void)
 #define INITERROR return
 
 PyMODINIT_FUNC
-init_cffi_backend(void)
+init_cffi1_backend(void)
 #endif
 {
     PyObject *m, *v;
@@ -5753,7 +5779,7 @@ init_cffi_backend(void)
 #if PY_MAJOR_VERSION >= 3
     m = PyModule_Create(&FFIBackendModuleDef);
 #else
-    m = Py_InitModule("_cffi_backend", FFIBackendMethods);
+    m = Py_InitModule("_cffi1_backend", FFIBackendMethods);
 #endif
 
     if (m == NULL)
@@ -5788,7 +5814,7 @@ init_cffi_backend(void)
     if (v == NULL || PyModule_AddObject(m, "_C_API", v) < 0)
         INITERROR;
 
-    v = PyText_FromString("0.9.2");
+    v = PyText_FromString("1.0.0");
     if (v == NULL || PyModule_AddObject(m, "__version__", v) < 0)
         INITERROR;
 
@@ -5831,6 +5857,9 @@ init_cffi_backend(void)
       INITERROR;
 
     init_errno();
+
+    if (init_ffi_lib(m) < 0)
+        INITERROR;
 
 #if PY_MAJOR_VERSION >= 3
     if (init_file_emulator() < 0)
