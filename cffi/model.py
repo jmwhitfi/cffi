@@ -169,6 +169,9 @@ class FunctionPtrType(BaseFunctionType):
         return global_cache(self, ffi, 'new_function_type',
                             tuple(args), result, self.ellipsis)
 
+    def as_raw_function(self):
+        return RawFunctionType(self.args, self.result, self.ellipsis)
+
 
 class PointerType(BaseType):
     _attrs_ = ('totype',)
@@ -219,7 +222,7 @@ class ArrayType(BaseType):
         elif length == '...':
             brackets = '&[/*...*/]'
         else:
-            brackets = '&[%d]' % length
+            brackets = '&[%s]' % length
         self.c_name_with_marker = (
             self.item.c_name_with_marker.replace('&', brackets))
 
@@ -451,11 +454,12 @@ def unknown_type(name, structname=None):
         structname = '$%s' % name
     tp = StructType(structname, None, None, None)
     tp.force_the_name(name)
+    tp.origin = "unknown_type"
     return tp
 
 def unknown_ptr_type(name, structname=None):
     if structname is None:
-        structname = '*$%s' % name
+        structname = '$$%s' % name
     tp = StructType(structname, None, None, None)
     return NamedPointerType(tp, name)
 
