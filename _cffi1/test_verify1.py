@@ -1,8 +1,8 @@
-import py, re
-import sys, os, math, weakref
-from cffi import FFI, VerificationError, VerificationMissing, model, FFIError
-from testing.support import *
-
+import sys, math, py
+from cffi import FFI, VerificationError, VerificationMissing, model
+from . import recompiler
+from .support import *
+import _cffi_backend
 
 lib_m = ['m']
 if sys.platform == 'win32':
@@ -10,7 +10,7 @@ if sys.platform == 'win32':
     import distutils.ccompiler
     if distutils.ccompiler.get_default_compiler() == 'msvc':
         lib_m = ['msvcrt']
-    pass      # no obvious -Werror equivalent on MSVC
+    extra_compile_args = []      # no obvious -Werror equivalent on MSVC
 else:
     if (sys.platform == 'darwin' and
           [int(x) for x in os.uname()[2].split('.')] >= [11, 0, 0]):
@@ -22,46 +22,21 @@ else:
         # assume a standard gcc
         extra_compile_args = ['-Werror', '-Wall', '-Wextra', '-Wconversion']
 
-    class FFI(FFI):
-        def verify(self, *args, **kwds):
-            return super(FFI, self).verify(
-                *args, extra_compile_args=extra_compile_args, **kwds)
+class FFI(FFI):
+    error = _cffi_backend.FFI.error
+    _extra_compile_args = extra_compile_args
+    _verify_counter = 0
 
-def setup_module():
-    import cffi.verifier
-    cffi.verifier.cleanup_tmpdir()
-    #
-    # check that no $ sign is produced in the C file; it used to be the
-    # case that anonymous enums would produce '$enum_$1', which was
-    # used as part of a function name.  GCC accepts such names, but it's
-    # apparently non-standard.
-    _r_comment = re.compile(r"/\*.*?\*/|//.*?$", re.DOTALL | re.MULTILINE)
-    _r_string = re.compile(r'\".*?\"')
-    def _write_source_and_check(self, file=None):
-        base_write_source(self, file)
-        if file is None:
-            f = open(self.sourcefilename)
-            data = f.read()
-            f.close()
-            data = _r_comment.sub(' ', data)
-            data = _r_string.sub('"skipped"', data)
-            assert '$' not in data
-    base_write_source = cffi.verifier.Verifier._write_source
-    cffi.verifier.Verifier._write_source = _write_source_and_check
+    def verify(self, preamble='', *args, **kwds):
+        FFI._verify_counter += 1
+        return recompiler.verify(self, 'verify%d' % FFI._verify_counter,
+                                 preamble, *args,
+                                 extra_compile_args=self._extra_compile_args,
+                                 **kwds)
 
+class FFI_warnings_not_error(FFI):
+    _extra_compile_args = []
 
-def test_module_type():
-    import cffi.verifier
-    ffi = FFI()
-    lib = ffi.verify()
-    if hasattr(lib, '_cffi_python_module'):
-        print('verify got a PYTHON module')
-    if hasattr(lib, '_cffi_generic_module'):
-        print('verify got a GENERIC module')
-    expected_generic = (cffi.verifier._FORCE_GENERIC_ENGINE or
-                        '__pypy__' in sys.builtin_module_names)
-    assert hasattr(lib, '_cffi_python_module') == (not expected_generic)
-    assert hasattr(lib, '_cffi_generic_module') == expected_generic
 
 def test_missing_function(ffi=None):
     # uses the FFI hacked above with '-Werror'
@@ -70,7 +45,7 @@ def test_missing_function(ffi=None):
     ffi.cdef("void some_completely_unknown_function();")
     try:
         lib = ffi.verify()
-    except (VerificationError, OSError):
+    except (VerificationError, OSError, ImportError):
         pass     # expected case: we get a VerificationError
     else:
         # but depending on compiler and loader details, maybe
@@ -81,8 +56,7 @@ def test_missing_function(ffi=None):
 
 def test_missing_function_import_error():
     # uses the original FFI that just gives a warning during compilation
-    import cffi
-    test_missing_function(ffi=cffi.FFI())
+    test_missing_function(ffi=FFI_warnings_not_error())
 
 def test_simple_case():
     ffi = FFI()
@@ -434,41 +408,45 @@ def test_nondecl_struct():
     assert lib.bar(ffi.NULL) == 42
 
 def test_ffi_full_struct():
-    ffi = FFI()
-    ffi.cdef("struct foo_s { char x; int y; long *z; };")
-    ffi.verify("struct foo_s { char x; int y; long *z; };")
+    def check(verified_code):
+        ffi = FFI()
+        ffi.cdef("struct foo_s { char x; int y; long *z; };")
+        ffi.verify(verified_code)
+        ffi.new("struct foo_s *")
+
+    check("struct foo_s { char x; int y; long *z; };")
     #
     if sys.platform != 'win32':  # XXX fixme: only gives warnings
-        py.test.raises(VerificationError, ffi.verify,
+        py.test.raises(VerificationError, check,
             "struct foo_s { char x; int y; int *z; };")
     #
-    py.test.raises(VerificationError, ffi.verify,
-        "struct foo_s { int y; long *z; };")
+    py.test.raises(VerificationError, check,
+        "struct foo_s { int y; long *z; };")     # cdef'ed field x is missing
     #
-    e = py.test.raises(VerificationError, ffi.verify,
-        "struct foo_s { int y; char x; long *z; };")
-    assert str(e.value) == (
+    e = py.test.raises(FFI.error, check,
+                       "struct foo_s { int y; char x; long *z; };")
+    assert str(e.value).startswith(
         "struct foo_s: wrong offset for field 'x'"
-        " (we have 0, but C compiler says 4)")
+        " (cdef says 0, but C compiler says 4)")
     #
-    e = py.test.raises(VerificationError, ffi.verify,
+    e = py.test.raises(FFI.error, check,
         "struct foo_s { char x; int y; long *z; char extra; };")
-    assert str(e.value) == (
+    assert str(e.value).startswith(
         "struct foo_s: wrong total size"
-        " (we have %d, but C compiler says %d)" % (
-            ffi.sizeof("struct foo_s"),
-            ffi.sizeof("struct foo_s") + ffi.sizeof("long*")))
+        " (cdef says %d, but C compiler says %d)" % (
+            8 + FFI().sizeof('long *'),
+            8 + FFI().sizeof('long *') * 2))
     #
     # a corner case that we cannot really detect, but where it has no
     # bad consequences: the size is the same, but there is an extra field
     # that replaces what is just padding in our declaration above
-    ffi.verify("struct foo_s { char x, extra; int y; long *z; };")
+    check("struct foo_s { char x, extra; int y; long *z; };")
     #
-    e = py.test.raises(VerificationError, ffi.verify,
+    e = py.test.raises(FFI.error, check,
         "struct foo_s { char x; short pad; short y; long *z; };")
-    assert str(e.value) == (
+    assert str(e.value).startswith(
         "struct foo_s: wrong size for field 'y'"
-        " (we have 4, but C compiler says 2)")
+        " (cdef says 4, but C compiler says 2)")
 
 def test_ffi_nonfull_struct():
     ffi = FFI()
@@ -504,7 +482,8 @@ def _check_field_match(typename, real, expect_mismatch):
     ffi.cdef("struct foo_s { %s x; ...; };" % typename)
     try:
         ffi.verify("struct foo_s { %s x; };" % real)
-    except VerificationError:
+        ffi.new("struct foo_s *")    # because some mismatches show up lazily
+    except (VerificationError, ffi.error):
         if not expect_mismatch:
             if testing_by_size and typename != real:
                 print("ignoring mismatch between %s* and %s* even though "
@@ -712,9 +691,10 @@ def test_full_enum():
     ffi.cdef("enum ee { EE1, EE2, EE3 };")
     ffi.verify("enum ee { EE1, EE2, EE3 };")
     py.test.raises(VerificationError, ffi.verify, "enum ee { EE1, EE2 };")
-    e = py.test.raises(VerificationError, ffi.verify,
-                       "enum ee { EE1, EE3, EE2 };")
-    assert str(e.value) == 'enum ee: EE2 has the real value 2, not 1'
+    # disabled: for now, we always accept and fix transparently constant values
+    #e = py.test.raises(VerificationError, ffi.verify,
+    #                   "enum ee { EE1, EE3, EE2 };")
+    #assert str(e.value) == 'enum ee: EE2 has the real value 2, not 1'
     # extra items cannot be seen and have no bad consequence anyway
     lib = ffi.verify("enum ee { EE1, EE2, EE3, EE4 };")
     assert lib.EE3 == 2
@@ -912,15 +892,6 @@ def test_access_callback_function_typedef():
     lib.cb = my_callback
     assert lib.foo(4) == 887
 
-def test_ctypes_backend_forces_generic_engine():
-    from cffi.backend_ctypes import CTypesBackend
-    ffi = FFI(backend=CTypesBackend())
-    ffi.cdef("int func(int a);")
-    lib = ffi.verify("int func(int a) { return a * 42; }")
-    assert not hasattr(lib, '_cffi_python_module')
-    assert hasattr(lib, '_cffi_generic_module')
-    assert lib.func(100) == 4200
-
 def test_call_with_struct_ptr():
     ffi = FFI()
     ffi.cdef("typedef struct { int x; ...; } foo_t; int foo(foo_t *);")
@@ -1050,7 +1021,7 @@ def test_autofilled_struct_as_argument_dynamic():
     ffi = FFI()
     ffi.cdef("struct foo_s { long a; ...; };\n"
              "int (*foo)(struct foo_s);")
-    e = py.test.raises(TypeError, ffi.verify, """
+    lib = ffi.verify("""
         struct foo_s {
             double b;
             long a;
@@ -1060,6 +1031,7 @@ def test_autofilled_struct_as_argument_dynamic():
         }
         int (*foo)(struct foo_s s) = &foo1;
     """)
+    e = py.test.raises(TypeError, "lib.foo")    # lazily
     msg ='cannot pass as an argument a struct that was completed with verify()'
     assert msg in str(e.value)
 
@@ -1161,10 +1133,12 @@ def test_typedef_complete_enum():
     assert lib.BB == 1
 
 def test_typedef_broken_complete_enum():
+    # xxx this is broken in old cffis, but works with recompiler.py
     ffi = FFI()
     ffi.cdef("typedef enum { AA, BB } enum1_t;")
-    py.test.raises(VerificationError, ffi.verify,
-                   "typedef enum { AA, CC, BB } enum1_t;")
+    lib = ffi.verify("typedef enum { AA, CC, BB } enum1_t;")
+    assert lib.AA == 0
+    assert lib.BB == 2
 
 def test_typedef_incomplete_enum():
     ffi = FFI()
@@ -1302,6 +1276,8 @@ def test_nested_anonymous_struct_exact():
     ffi.cdef("""
         struct foo_s { struct { int a; char b; }; union { char c, d; }; };
     """)
+    assert ffi.offsetof("struct foo_s", "c") == 2 * ffi.sizeof("int")
+    assert ffi.sizeof("struct foo_s") == 3 * ffi.sizeof("int")
     ffi.verify("""
         struct foo_s { struct { int a; char b; }; union { char c, d; }; };
     """)
@@ -1325,9 +1301,10 @@ def test_nested_anonymous_struct_exact_error():
     py.test.raises(VerificationError, ffi.verify, """
         struct foo_s { struct { int a; short b; }; union { char c, d; }; };
     """)
-    py.test.raises(VerificationError, ffi.verify, """
-        struct foo_s { struct { int a; char e, b; }; union { char c, d; }; };
-    """)
+    # works fine now
+    #py.test.raises(VerificationError, ffi.verify, """
+    #    struct foo_s { struct { int a; char e, b; }; union { char c, d; }; };
+    #""")
 
 def test_nested_anonymous_struct_inexact_1():
     ffi = FFI()
@@ -1407,6 +1384,7 @@ def test_tmpdir():
     assert lib.foo(100) == 142
 
 def test_relative_to():
+    py.test.skip("not available")
     import tempfile, os
     from testing.udir import udir
     tmpdir = tempfile.mkdtemp(dir=str(udir))
@@ -1557,6 +1535,7 @@ def test_addressof():
     py.test.raises(TypeError, lib.sum_coord, res2)
 
 def test_callback_in_thread():
+    py.test.xfail("adapt or remove")
     if sys.platform == 'win32':
         py.test.skip("pthread only")
     import os, subprocess, imp
@@ -1567,6 +1546,7 @@ def test_callback_in_thread():
     assert result == 0
 
 def test_keepalive_lib():
+    py.test.xfail("adapt or remove")
     ffi = FFI()
     ffi.cdef("int foobar(void);")
     lib = ffi.verify("int foobar(void) { return 42; }")
@@ -1580,6 +1560,7 @@ def test_keepalive_lib():
     assert func() == 42
 
 def test_keepalive_ffi():
+    py.test.xfail("adapt or remove")
     ffi = FFI()
     ffi.cdef("int foobar(void);")
     lib = ffi.verify("int foobar(void) { return 42; }")
@@ -1664,6 +1645,8 @@ def test_global_array_with_dotdotdot_length():
     assert repr(lib.fooarray).startswith("<cdata 'int[50]'")
 
 def test_bad_global_array_with_dotdotdot_length():
+    py.test.xfail("was detected only because 23 bytes cannot be divided by 4; "
+                  "redo more generally")
     ffi = FFI()
     ffi.cdef("int fooarray[...];")
     py.test.raises(VerificationError, ffi.verify, "char fooarray[23];")
@@ -1687,6 +1670,7 @@ def test_struct_returned_by_func():
         "function myfunc: 'foo_t' is used as result type, but is opaque")
 
 def test_include():
+    py.test.xfail("test_include")
     ffi1 = FFI()
     ffi1.cdef("typedef struct { int x; ...; } foo_t;")
     ffi1.verify("typedef struct { int y, x; } foo_t;")
@@ -1745,18 +1729,17 @@ def test_enum_size():
 
 def test_enum_bug118():
     maxulong = 256 ** FFI().sizeof("unsigned long") - 1
-    for c1, c2, c2c in [(0xffffffff, -1, ''),
-                        (maxulong, -1, ''),
-                        (-1, 0xffffffff, 'U'),
-                        (-1, maxulong, 'UL')]:
+    for c2, c2c in [(-1, ''),
+                    (-1, ''),
+                    (0xffffffff, 'U'),
+                    (maxulong, 'UL'),
+                    (-maxulong / 3, 'L')]:
         if c2c and sys.platform == 'win32':
             continue     # enums may always be signed with MSVC
         ffi = FFI()
-        ffi.cdef("enum foo_e { AA=%s };" % c1)
-        e = py.test.raises(VerificationError, ffi.verify,
-                           "enum foo_e { AA=%s%s };" % (c2, c2c))
-        assert str(e.value) == ('enum foo_e: AA has the real value %d, not %d'
-                                % (c2, c1))
+        ffi.cdef("enum foo_e { AA };")
+        lib = ffi.verify("enum foo_e { AA=%s%s };" % (c2, c2c))
+        assert lib.AA == c2
 
 def test_string_to_voidp_arg():
     ffi = FFI()
@@ -1914,8 +1897,7 @@ def test_bug_const_char_ptr_array_1():
     assert repr(ffi.typeof(lib.a)) == "<ctype 'char *[5]'>"
 
 def test_bug_const_char_ptr_array_2():
-    from cffi import FFI     # ignore warnings
-    ffi = FFI()
+    ffi = FFI_warnings_not_error()    # ignore warnings
     ffi.cdef("""const int a[];""")
     lib = ffi.verify("""const int a[5];""")
     assert repr(ffi.typeof(lib.a)) == "<ctype 'int *'>"
@@ -2100,6 +2082,7 @@ def test_getlasterror_working_even_with_pypys_jit():
             assert ffi.getwinerror()[0] == n
 
 def test_verify_dlopen_flags():
+    py.test.xfail("dlopen flags")
     # Careful with RTLD_GLOBAL.  If by chance the FFI is not deleted
     # promptly, like on PyPy, then other tests may see the same
     # exported symbols as well.  So we must not export a simple name
@@ -2178,13 +2161,6 @@ def test_implicit_unicode_on_windows():
         assert ord(outbuf[n]) == 0
         assert ord(outbuf[0]) < 128     # should be a letter, or '\'
 
-def test_use_local_dir():
-    ffi = FFI()
-    lib = ffi.verify("", modulename="test_use_local_dir")
-    this_dir = os.path.dirname(__file__)
-    pycache_files = os.listdir(os.path.join(this_dir, '__pycache__'))
-    assert any('test_use_local_dir' in s for s in pycache_files)
-
 def test_define_known_value():
     ffi = FFI()
     ffi.cdef("#define FOO 0x123")
@@ -2194,5 +2170,5 @@ def test_define_known_value():
 def test_define_wrong_value():
     ffi = FFI()
     ffi.cdef("#define FOO 123")
-    e = py.test.raises(VerificationError, ffi.verify, "#define FOO 124")
-    assert str(e.value).endswith("FOO has the real value 124, not 123")
+    lib = ffi.verify("#define FOO 124")     # used to complain
+    assert lib.FOO == 124
