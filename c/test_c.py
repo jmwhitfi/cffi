@@ -185,10 +185,9 @@ def test_float_types():
         py.test.raises(TypeError, cast, p, None)
 
 def test_complex_types():
-    py.test.skip("later")
     INF = 1E200 * 1E200
     for name in ["float", "double"]:
-        p = new_primitive_type("_Complex " + name)
+        p = new_primitive_type(name + " _Complex")
         assert bool(cast(p, 0))
         assert bool(cast(p, INF))
         assert bool(cast(p, -INF))
@@ -200,22 +199,23 @@ def test_complex_types():
         py.test.raises(TypeError, float, cast(p, -150))
         assert complex(cast(p, 1.25)) == 1.25
         assert complex(cast(p, 1.25j)) == 1.25j
-        assert float(cast(p, INF*1j)) == INF*1j
-        assert float(cast(p, -INF)) == -INF
+        assert complex(cast(p, complex(0,INF))) == complex(0,INF)
+        assert complex(cast(p, -INF)) == -INF
         if name == "float":
             assert complex(cast(p, 1.1j)) != 1.1j         # rounding error
             assert complex(cast(p, 1E200+3j)) == INF+3j   # limited range
-            assert complex(cast(p, 3+1E200j)) == 3+INF*1j # limited range
+            assert complex(cast(p, complex(3,1E200))) == complex(3,INF) # limited range
 
         assert cast(p, -1.1j) != cast(p, -1.1j)
         assert repr(complex(cast(p, -0.0)).real) == '-0.0'
-        assert repr(complex(cast(p, -0j))) == '-0j'
-        assert complex(cast(p, '\x09')) == 9.0
+        #assert repr(complex(cast(p, -0j))) == '-0j'   # http://bugs.python.org/issue29602
+        assert complex(cast(p, b'\x09')) == 9.0
+        assert complex(cast(p, u+'\x09')) == 9.0
         assert complex(cast(p, True)) == 1.0
         py.test.raises(TypeError, cast, p, None)
         #
-        py.test.raises(cast, new_primitive_type(name), 1+2j)
-    py.test.raises(cast, new_primitive_type("int"), 1+2j)
+        py.test.raises(TypeError, cast, new_primitive_type(name), 1+2j)
+    py.test.raises(TypeError, cast, new_primitive_type("int"), 1+2j)
 
 def test_character_type():
     p = new_primitive_type("char")
@@ -1115,6 +1115,29 @@ def test_call_function_9():
     BUChar = new_primitive_type("unsigned char")
     BSShort = new_primitive_type("short")
     assert f(3, cast(BSChar, -3), cast(BUChar, 200), cast(BSShort, -5)) == 192
+
+def test_call_function_24():
+    py.test.skip("libffi returning nonsense silently")
+    BFloat = new_primitive_type("float")
+    BFloatComplex = new_primitive_type("float _Complex")
+    BFunc3 = new_function_type((BFloat, BFloat), BFloatComplex, False)
+    f = cast(BFunc3, _testfunc(24))
+    result = f(1.25, 5.1)
+    assert type(result) == complex
+    assert result.real == 1.25   # exact
+    assert (result.imag != 2*5.1) and (abs(result.imag - 2*5.1) < 1e-5) # inexact  
+
+def test_call_function_25():
+    py.test.skip("libffi returning nonsense silently")
+    BDouble = new_primitive_type("double")
+    BDoubleComplex = new_primitive_type("double _Complex")
+    BFunc3 = new_function_type((BDouble, BDouble), BDoubleComplex, False)
+    f = cast(BFunc3, _testfunc(25))
+    result = f(1.25, 5.1)
+    assert type(result) == complex
+    assert result.real == 1.25   # exact
+    assert (result.imag != 2*5.1) and (abs(result.imag - 2*5.1) < 1e-10) # inexact  
+
 
 def test_cannot_call_with_a_autocompleted_struct():
     BSChar = new_primitive_type("signed char")
