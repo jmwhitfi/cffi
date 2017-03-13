@@ -62,6 +62,8 @@
 
 #include "malloc_closure.h"
 
+#include <complex.h>
+
 #if PY_MAJOR_VERSION >= 3
 # define STR_OR_BYTES "bytes"
 # define PyText_Type PyUnicode_Type
@@ -127,6 +129,8 @@
 #define CT_FUNCTIONPTR      256    /* pointer to function */
 #define CT_VOID             512    /* void */
 
+#define CT_PRIMITIVE_COMPLEX 16777216  /* float _Complex, double _Complex */
+
 /* other flags that may also be set in addition to the base flag: */
 #define CT_IS_VOIDCHAR_PTR       1024
 #define CT_PRIMITIVE_FITS_LONG   2048
@@ -145,7 +149,8 @@
 #define CT_PRIMITIVE_ANY  (CT_PRIMITIVE_SIGNED |        \
                            CT_PRIMITIVE_UNSIGNED |      \
                            CT_PRIMITIVE_CHAR |          \
-                           CT_PRIMITIVE_FLOAT)
+                           CT_PRIMITIVE_FLOAT |         \
+                           CT_PRIMITIVE_COMPLEX)
 
 typedef struct _ctypedescr {
     PyObject_VAR_HEAD
@@ -883,6 +888,26 @@ read_raw_longdouble_data(char *target)
     return 0;
 }
 
+static Py_complex
+read_raw_complex_data(char *target, int size)
+{
+    Py_complex r = {.real=0, .imag=0};
+    if (size == 2*sizeof(float)) {
+        float real_part, imag_part;
+        memcpy(&real_part, target + 0,             sizeof(float));
+        memcpy(&imag_part, target + sizeof(float), sizeof(float));
+        r.real = real_part;
+        r.imag = imag_part;
+        return r;
+    }
+    if (size == 2*sizeof(double)) {
+        memcpy(&(r.real), target, 2*sizeof(double));
+        return r;
+    }
+    Py_FatalError("read_raw_complex_data: bad float size");
+    return r;
+}
+
 static void
 write_raw_float_data(char *target, double source, int size)
 {
@@ -896,6 +921,25 @@ write_raw_longdouble_data(char *target, long double source)
 {
     int size = sizeof(long double);
     _write_raw_data(long double);
+}
+
+#define _write_raw_complex_data(type)                      \
+    do {                                                   \
+        if (size == 2*sizeof(type)) {                      \
+            type r = (type)source.real;                    \
+            memcpy(target, &r, sizeof(type));              \
+            type i = (type)source.imag;                    \
+            memcpy(target+sizeof(type), &i, sizeof(type)); \
+            return;                                        \
+        }                                                  \
+    } while(0)
+
+static void
+write_raw_complex_data(char *target, Py_complex source, int size)
+{
+    _write_raw_complex_data(float);
+    _write_raw_complex_data(double);
+    Py_FatalError("write_raw_complex_data: bad float size");
 }
 
 static PyObject *
@@ -1005,6 +1049,10 @@ convert_to_object(char *data, CTypeDescrObject *ct)
                 write_raw_longdouble_data(cd->c_data, value);
             return (PyObject *)cd;
         }
+    }
+    else if (ct->ct_flags & CT_PRIMITIVE_COMPLEX) {
+        Py_complex value = read_raw_complex_data(data, ct->ct_size);
+        return PyComplex_FromCComplex(value);
     }
     else if (ct->ct_flags & CT_PRIMITIVE_CHAR) {
         /*READ(data, ct->ct_size)*/
@@ -2024,6 +2072,11 @@ static PyObject *cdata_float(CDataObject *cd)
         }
         return PyFloat_FromDouble(value);
     }
+    if ((cd->c_type->ct_flags & CT_PRIMITIVE_COMPLEX) &&
+        (cd->c_type->ct_size<16)) {
+        double value = read_raw_float_data(cd->c_data, cd->c_type->ct_size);
+        return PyComplex_FromDoubles(value, 0.0);
+    }
     PyErr_Format(PyExc_TypeError, "float() not supported on cdata '%s'",
                  cd->c_type->ct_name);
     return NULL;
@@ -2904,6 +2957,22 @@ static PyObject *cdata_dir(PyObject *cd, PyObject *noarg)
     }
 }
 
+static PyObject *cdata_complex(PyObject *cd_, PyObject *noarg)
+{
+    CDataObject *cd = (CDataObject *)cd_;
+
+    if (cd->c_type->ct_flags & CT_PRIMITIVE_COMPLEX) {
+        Py_complex value = read_raw_complex_data(cd->c_data, cd->c_type->ct_size);
+        PyObject *op = PyComplex_FromCComplex(value);
+        PyComplexObject *opc = (PyComplexObject *) op;
+        printf("%f %f\n",opc->cval.real,opc->cval.imag);
+        return op;
+    }
+    PyErr_Format(PyExc_TypeError, "complex() not supported on cdata '%s'",
+                 cd->c_type->ct_name);
+    return NULL;
+}
+
 static PyObject *cdata_iter(CDataObject *);
 
 static PyNumberMethods CData_as_number = {
@@ -2953,8 +3022,9 @@ static PyMappingMethods CDataOwn_as_mapping = {
 };
 
 static PyMethodDef cdata_methods[] = {
-    {"__dir__",   cdata_dir,      METH_NOARGS},
-    {NULL,        NULL}           /* sentinel */
+    {"__dir__",     cdata_dir,      METH_NOARGS},
+    {"__complex__", cdata_complex,  METH_NOARGS},
+    {NULL,          NULL}           /* sentinel */
 };
 
 static PyTypeObject CData_Type = {
@@ -3587,6 +3657,36 @@ static CDataObject *cast_to_integer_or_char(CTypeDescrObject *ct, PyObject *ob)
     return cd;
 }
 
+static void check_bytes_for_float_compatible(
+        PyObject *io,
+        double * value,
+        int * got_value_indicator,
+        int * cannot_cast_indicator)
+{
+    *got_value_indicator = 0;
+    *cannot_cast_indicator = 0;
+    if (PyBytes_Check(io)) {
+        if (PyBytes_GET_SIZE(io) != 1) {
+            Py_DECREF(io);
+            *cannot_cast_indicator = 1;
+        }
+        *value = (unsigned char)PyBytes_AS_STRING(io)[0];
+        *got_value_indicator = 1;
+    }
+#if HAVE_WCHAR_H
+    else if (PyUnicode_Check(io)) {
+        wchar_t ordinal;
+        if (_my_PyUnicode_AsSingleWideChar(io, &ordinal) < 0) {
+            Py_DECREF(io);
+            *cannot_cast_indicator = 1;
+        }
+        *value = (long)ordinal;
+        *got_value_indicator = 1;
+    }
+#endif
+
+}
+
 static PyObject *do_cast(CTypeDescrObject *ct, PyObject *ob)
 {
     CDataObject *cd;
@@ -3643,23 +3743,16 @@ static PyObject *do_cast(CTypeDescrObject *ct, PyObject *ob)
             Py_INCREF(io);
         }
 
-        if (PyBytes_Check(io)) {
-            if (PyBytes_GET_SIZE(io) != 1) {
-                Py_DECREF(io);
-                goto cannot_cast;
-            }
-            value = (unsigned char)PyBytes_AS_STRING(io)[0];
+        int got_value_indicator;
+        int cannot_cast_indicator;
+        check_bytes_for_float_compatible(io, &value,
+                &got_value_indicator, &cannot_cast_indicator);
+        if (cannot_cast_indicator) {
+            goto cannot_cast;
         }
-#if HAVE_WCHAR_H
-        else if (PyUnicode_Check(io)) {
-            wchar_t ordinal;
-            if (_my_PyUnicode_AsSingleWideChar(io, &ordinal) < 0) {
-                Py_DECREF(io);
-                goto cannot_cast;
-            }
-            value = (long)ordinal;
+        if (got_value_indicator) {
+            // got it from string
         }
-#endif
         else if ((ct->ct_flags & CT_IS_LONGDOUBLE) &&
                  CData_Check(io) &&
                  (((CDataObject *)io)->c_type->ct_flags & CT_IS_LONGDOUBLE)) {
@@ -3689,6 +3782,51 @@ static PyObject *do_cast(CTypeDescrObject *ct, PyObject *ob)
         }
         return (PyObject *)cd;
     }
+
+
+    else if (ct->ct_flags & CT_PRIMITIVE_COMPLEX) {
+        /* cast to a complex */
+        Py_complex value;
+        PyObject *io;
+        if (CData_Check(ob)) {
+            CDataObject *cdsrc = (CDataObject *)ob;
+
+            if (!(cdsrc->c_type->ct_flags & CT_PRIMITIVE_ANY))
+                goto cannot_cast;
+            io = convert_to_object(cdsrc->c_data, cdsrc->c_type);
+            if (io == NULL)
+                return NULL;
+        }
+        else {
+            io = ob;
+            Py_INCREF(io);
+        }
+
+        int got_value_indicator;
+        int cannot_cast_indicator;
+        check_bytes_for_float_compatible(io, &(value.real),
+                &got_value_indicator, &cannot_cast_indicator);
+        if (cannot_cast_indicator) {
+            goto cannot_cast;
+        }
+        if (got_value_indicator) {
+            // got it from string
+            value.imag = 0.0;
+        } else {
+            value = PyComplex_AsCComplex(io);
+        }
+        Py_DECREF(io);
+        if (value.real == -1.0 && value.imag == 0.0 && PyErr_Occurred()) {
+            return NULL;
+        }
+        cd = _new_casted_primitive(ct);
+        if (cd != NULL) {
+            write_raw_complex_data(cd->c_data, value, ct->ct_size);
+        }
+        return (PyObject *)cd;
+    }
+
+
     else {
         PyErr_Format(PyExc_TypeError, "cannot cast to ctype '%s'",
                      ct->ct_name);
@@ -3971,6 +4109,8 @@ static PyObject *new_primitive_type(const char *name)
        EPTYPE(f, float, CT_PRIMITIVE_FLOAT )                    \
        EPTYPE(d, double, CT_PRIMITIVE_FLOAT )                   \
        EPTYPE(ld, long double, CT_PRIMITIVE_FLOAT | CT_IS_LONGDOUBLE ) \
+       EPTYPE(fc, float _Complex, CT_PRIMITIVE_COMPLEX )        \
+       EPTYPE(dc, double _Complex, CT_PRIMITIVE_COMPLEX )       \
        ENUM_PRIMITIVE_TYPES_WCHAR                               \
        EPTYPE(b, _Bool, CT_PRIMITIVE_UNSIGNED | CT_IS_BOOL )    \
      /* the following types are not primitive in the C sense */ \
@@ -4078,6 +4218,16 @@ static PyObject *new_primitive_type(const char *name)
             else
                 ffitype = &ffi_type_longdouble;
         }
+        else
+            goto bad_ffi_type;
+    }
+    else if (ptypes->flags & CT_PRIMITIVE_COMPLEX) {
+        // as of March 2017, still no libffi support for complex
+        // but it fails silently.
+        if (strcmp(ptypes->name, "float _Complex") == 0)
+            ffitype = &ffi_type_complex_float;
+        else if (strcmp(ptypes->name, "double _Complex") == 0)
+            ffitype = &ffi_type_complex_double;
         else
             goto bad_ffi_type;
     }
@@ -6578,6 +6728,14 @@ static int _testfunc23(char *p)
         return 1000 * p[0];
     return -42;
 }
+static float _Complex _testfunc24(float a, float b)
+{
+    return a + I*2.0*b;
+}
+static double _Complex _testfunc25(double a, double b)
+{
+    return a + I*2.0*b;
+}
 
 static PyObject *b__testfunc(PyObject *self, PyObject *args)
 {
@@ -6611,6 +6769,8 @@ static PyObject *b__testfunc(PyObject *self, PyObject *args)
     case 21: f = &_testfunc21; break;
     case 22: f = &_testfunc22; break;
     case 23: f = &_testfunc23; break;
+    case 24: f = &_testfunc24; break;
+    case 25: f = &_testfunc25; break;
     default:
         PyErr_SetNone(PyExc_ValueError);
         return NULL;
