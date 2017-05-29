@@ -25,7 +25,7 @@ enum token_e {
     /* keywords */
     TOK__BOOL,
     TOK_CHAR,
-    //TOK__COMPLEX,
+    TOK__COMPLEX,
     TOK_CONST,
     TOK_DOUBLE,
     TOK_ENUM,
